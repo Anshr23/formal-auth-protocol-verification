@@ -1,0 +1,59 @@
+MODULE main
+
+VAR
+    state : {Idle, UsernameEntered, PasswordEntered, Authenticated, Locked, AccessGranted};
+
+    attempts : 0..3;
+
+    credentials_valid : boolean;
+
+ASSIGN
+
+    init(state) := Idle;
+    init(attempts) := 0;
+
+    next(state) := case
+
+        state = Idle :
+            {Idle, UsernameEntered};
+
+        state = UsernameEntered :
+            {PasswordEntered};
+
+        state = PasswordEntered & credentials_valid :
+            Authenticated;
+
+        state = PasswordEntered & !credentials_valid & attempts < 3 :
+            UsernameEntered;
+
+        state = PasswordEntered & !credentials_valid & attempts = 3 :
+            Locked;
+
+        state = Authenticated :
+            {Authenticated, AccessGranted, Idle};
+
+        state = AccessGranted :
+            {AccessGranted, Idle};
+
+        state = Locked :
+            Locked;
+
+        TRUE : state;
+
+    esac;
+
+    next(attempts) := case
+        state = PasswordEntered & !credentials_valid :
+            min(attempts + 1, 3);
+
+        state = Authenticated | state = Idle :
+            0;
+
+        TRUE : attempts;
+    esac;
+
+    -- Environment nondeterminism
+    next(credentials_valid) := {TRUE, FALSE};
+
+
+SPEC EF state = AccessGranted
