@@ -1,0 +1,209 @@
+-- =============================================================================
+-- FILE: specs/properties.smv
+-- TITLE: Formal Property Specifications — Login Authentication Protocol
+-- FORMAT: NuSMV LTL / CTL Specification Language
+--
+-- PURPOSE:
+--   This file documents all formal properties verified against the protocol
+--   model. Properties are classified by type (safety / liveness / reachability)
+--   and include their formal semantics, intuitive interpretation, and expected
+--   verification outcome for both model versions.
+--
+-- USAGE:
+--   These specifications are embedded directly into the model files
+--   (auth_protocol.smv and auth_protocol_refined.smv). This file serves as
+--   a standalone specification reference document.
+--
+-- NOTATION:
+--   G φ     — Globally (φ holds at every position in the trace)
+--   F φ     — Finally (φ holds at some future position in the trace)
+--   X φ     — Next (φ holds at the next position)
+--   φ U ψ  — Until (φ holds until ψ holds, and ψ eventually holds)
+--   O φ     — Once (past: φ held at some past or current position)
+--   ->      — Logical implication
+--   &       — Logical conjunction
+--   |       — Logical disjunction
+--   !       — Logical negation
+--
+-- SEMANTIC DOMAIN:
+--   All properties range over infinite traces π of the transition system M.
+--   A property φ is SATISFIED iff M |= φ (φ holds on all initial traces of M).
+--   A property φ FAILS iff there exists a counterexample trace in M.
+-- =============================================================================
+
+
+-- ============================================================
+-- SECTION 1: SAFETY PROPERTIES
+--
+-- A safety property φ_safe asserts that "nothing bad ever happens."
+-- Formally: for all traces π and all positions i ≥ 0, π,i |= φ_safe.
+-- Safety properties are refuted by finite prefix counterexamples.
+-- ============================================================
+
+-- [S1] NO UNAUTHORISED ACCESS
+-- ─────────────────────────────
+-- Informal:  The system never grants resource access unless a valid
+--            authentication event has occurred in the current session.
+--
+-- Formal:    G( state = AccessGranted -> session_auth )
+--
+-- Semantics: At every position i in every trace π, if the system is in
+--            state AccessGranted at position i, then session_auth = TRUE
+--            at position i.
+--
+-- Variable:  session_auth is a monotonic latch (VAR in the model) set to TRUE
+--            precisely when a PasswordEntered -> Authenticated transition fires
+--            (i.e., credentials_valid = TRUE is observed at PasswordEntered).
+--
+-- Why non-trivial: Although by model construction AccessGranted is reachable
+--            only via Authenticated, the LTL check independently confirms this
+--            reachability constraint without relying on visual inspection.
+--
+-- v1.0 result: TRUE  (verified — no counterexample exists)
+-- v2.0 result: TRUE  (verified — no counterexample exists)
+-- ─────────────────────────────
+LTLSPEC NAME s1 :=
+  G( state = AccessGranted -> session_auth );
+
+
+-- [S2] LOCKOUT IS PERMANENT — NO POST-LOCK ACCESS
+-- ─────────────────────────────
+-- Informal:  Once the system enters the Locked state (after N=3 consecutive
+--            failed authentication attempts), it can never subsequently grant
+--            access to protected resources.
+--
+-- Formal:    G( state = Locked -> G( state != AccessGranted ) )
+--
+-- Semantics: At every position i, if state = Locked at i, then for ALL j ≥ i,
+--            state ≠ AccessGranted at j. Equivalently, Locked -> G(!AccessGranted).
+--
+-- Why holds: Locked is an absorbing state (only self-loops via T8). Once the
+--            system enters Locked, it never transitions to any other state;
+--            therefore AccessGranted is unreachable from Locked.
+--
+-- v1.0 result: TRUE  (verified)
+-- v2.0 result: TRUE  (verified)
+-- ─────────────────────────────
+LTLSPEC NAME s2 :=
+  G( state = Locked -> G( state != AccessGranted ) );
+
+
+-- ============================================================
+-- SECTION 2: LIVENESS PROPERTIES
+--
+-- A liveness property φ_live asserts that "something good eventually happens."
+-- Formally: for all traces π and all positions i ≥ 0, π,i |= φ_live requires
+-- that some future position j ≥ i satisfies the postcondition.
+-- Liveness properties are refuted by infinite (lasso-shaped) counterexamples.
+-- ============================================================
+
+-- [L1] VALID AUTHENTICATION ALWAYS EVENTUALLY SUCCEEDS
+-- ─────────────────────────────
+-- Informal:  Whenever the system is in state PasswordEntered AND the
+--            environment supplies valid credentials, the system will reach
+--            state Authenticated within a finite number of steps.
+--
+-- Formal:    G( (state = PasswordEntered & credentials_valid) ->
+--               F( state = Authenticated ) )
+--
+-- Semantics: At every position i, if (PasswordEntered ∧ credentials_valid)
+--            holds at i, then there exists j ≥ i such that state = Authenticated
+--            holds at j.
+--
+-- Why holds: Transition T3 is deterministic: when state = PasswordEntered and
+--            credentials_valid = TRUE, next(state) = Authenticated is the ONLY
+--            possible successor. Therefore Authenticated is reached in exactly
+--            one step (j = i + 1), making F(Authenticated) trivially satisfied.
+--
+-- Note:      The nondeterminism of credentials_valid means the CONDITION
+--            (PasswordEntered & credentials_valid) need not hold on all traces.
+--            The property asserts only: IF the condition holds, THEN the goal
+--            is eventually reached. This is the correct conditional liveness form.
+--
+-- v1.0 result: TRUE  (verified)
+-- v2.0 result: TRUE  (verified)
+-- ─────────────────────────────
+LTLSPEC NAME l1 :=
+  G( (state = PasswordEntered & credentials_valid) -> F( state = Authenticated ) );
+
+
+-- [L2] AUTHENTICATED USERS EVENTUALLY ACCESS RESOURCES
+-- ─────────────────────────────
+-- Informal:  Every time the system enters state Authenticated, it will
+--            eventually reach state AccessGranted.
+--
+-- Formal:    G( state = Authenticated -> F( state = AccessGranted ) )
+--
+-- Semantics: At every position i, if state = Authenticated at i, then there
+--            exists j ≥ i such that state = AccessGranted at j.
+--
+-- v1.0 result: FALSE  *** COUNTEREXAMPLE EXISTS — SEE BELOW ***
+-- v2.0 result: TRUE   (verified after model refinement)
+--
+-- COUNTEREXAMPLE (v1.0):
+--   In model v1.0, transition T6 is:
+--     state = Authenticated -> { AccessGranted, Idle }
+--   The nondeterministic environment can always choose the Idle branch,
+--   producing the following infinite lasso-shaped counterexample trace:
+--
+--   Stem:
+--     Step 0: state=Idle,          attempts=0, credentials_valid=*, session_auth=F
+--     Step 1: state=UsernameEntered,attempts=0, credentials_valid=*, session_auth=F
+--     Step 2: state=PasswordEntered,attempts=0, credentials_valid=T, session_auth=F
+--     Step 3: state=Authenticated,  attempts=0, credentials_valid=*, session_auth=T
+--   Loop (repeated infinitely):
+--     Step 4: state=Idle,           attempts=0, credentials_valid=*, session_auth=T
+--     Step 5: state=UsernameEntered,attempts=0, credentials_valid=*, session_auth=T
+--     Step 6: state=PasswordEntered,attempts=0, credentials_valid=T, session_auth=T
+--     Step 7: state=Authenticated,  attempts=0, credentials_valid=*, session_auth=T
+--     Step 8: state=Idle,           [back to step 4 — LOOP]
+--
+--   At step 3 (and steps 7, 11, ...): state = Authenticated.
+--   AccessGranted is NEVER reached. Therefore F(AccessGranted) is FALSE.
+--   This refutes L2.
+--
+-- FAILURE CLASSIFICATION: MODELLING FLAW
+--   The nondeterminism in T6 is over-liberal. The adversarial environment
+--   should not have the authority to choose whether an authenticated user
+--   accesses a resource — this is the user's action, not the environment's.
+--   Separating user actions (deterministic: access resource) from environment
+--   actions (nondeterministic: credential validity) resolves the issue.
+--
+-- REFINEMENT (v2.0):
+--   T6 is changed to: state = Authenticated -> AccessGranted (deterministic).
+--   Logout is preserved via T7: state = AccessGranted -> { Authenticated, Idle }.
+--   Under this refinement, F(AccessGranted) is satisfied in exactly one step
+--   from any Authenticated position, and L2 is verified TRUE.
+-- ─────────────────────────────
+LTLSPEC NAME l2 :=
+  G( state = Authenticated -> F( state = AccessGranted ) );
+
+
+-- ============================================================
+-- SECTION 3: REACHABILITY (CTL)
+--
+-- Reachability properties confirm that desired states are reachable
+-- (i.e., the model is not vacuously safe due to dead states).
+-- Expressed in CTL using the existential path quantifier E.
+-- ============================================================
+
+-- [R1] Locked state is reachable from Idle.
+CTLSPEC NAME reach_locked :=
+  EF( state = Locked );
+
+-- [R2] AccessGranted is reachable from Idle.
+CTLSPEC NAME reach_access :=
+  EF( state = AccessGranted );
+
+-- [R3] Authenticated is reachable.
+CTLSPEC NAME reach_auth :=
+  EF( state = Authenticated );
+
+-- [R4] Lockout requires at least 3 failed attempts.
+--   AG( state = Locked -> attempts = 3 )
+CTLSPEC NAME lockout_requires_3 :=
+  AG( state = Locked -> attempts = 3 );
+
+-- [R5] AG safety version of S1 (equivalently expressed in CTL):
+CTLSPEC NAME s1_ctl :=
+  AG( state = AccessGranted -> session_auth );

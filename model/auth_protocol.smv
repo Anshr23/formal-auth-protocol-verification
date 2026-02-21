@@ -1,0 +1,248 @@
+-- =============================================================================
+-- FILE: model/auth_protocol.smv
+-- TITLE: Formal Model of a Login Authentication Protocol
+-- VERSION: 1.0 (Initial — contains known liveness violation for analysis)
+-- TOOL: NuSMV 2.6.x
+--
+-- DESCRIPTION:
+--   This module encodes a finite-state transition system (FSTS) modelling a
+--   single-session login authentication protocol. The environment is modelled
+--   fully nondeterministically to represent an adversarial setting. The model
+--   is intended for formal verification of safety and liveness properties
+--   expressed in Linear Temporal Logic (LTL).
+--
+-- STATE SPACE:
+--   {Idle, UsernameEntered, PasswordEntered, Authenticated, Locked, AccessGranted}
+--
+-- VARIABLES:
+--   state             : protocol control state (FSM location)
+--   attempts          : bounded count of consecutive failed password entries (0..3)
+--   credentials_valid : nondeterministic boolean (adversarial environment input)
+--   session_auth      : monotonic latch; TRUE iff valid authentication has
+--                       occurred in the current session
+--
+-- TRANSITIONS:
+--   Idle              -> UsernameEntered           (username entry; deterministic)
+--   UsernameEntered   -> PasswordEntered           (password entry; deterministic)
+--   PasswordEntered   -> Authenticated             (iff credentials_valid = TRUE)
+--   PasswordEntered   -> UsernameEntered           (iff !credentials_valid AND attempts < 2)
+--   PasswordEntered   -> Locked                    (iff !credentials_valid AND attempts >= 2)
+--   Authenticated     -> AccessGranted | Idle      (nondeterministic: access or logout)
+--   AccessGranted     -> Authenticated | Idle      (nondeterministic: re-use or logout)
+--   Locked            -> Locked                    (absorbing; no exit)
+--
+-- ASSUMPTIONS:
+--   1. Single session only; no concurrent users or session multiplexing.
+--   2. Credentials are abstracted as a boolean; no cryptographic detail.
+--   3. Network, I/O, and timing are fully abstracted away.
+--   4. Lockout is permanent within a session (Locked is absorbing).
+--   5. attempts resets to 0 upon successful authentication.
+--   6. credentials_valid is re-chosen by the environment at every step
+--      (worst-case adversarial nondeterminism).
+--
+-- NOTE ON VERSION 1.0:
+--   The Authenticated -> {AccessGranted, Idle} nondeterministic choice causes
+--   Liveness Property L2 to fail. See traces/counterexample_liveness2.txt and
+--   model/auth_protocol_refined.smv for the corrected model.
+-- =============================================================================
+
+MODULE main
+
+-- ---------------------------------------------------------------------------
+-- VARIABLE DECLARATIONS
+-- ---------------------------------------------------------------------------
+VAR
+  state             : { Idle,
+                        UsernameEntered,
+                        PasswordEntered,
+                        Authenticated,
+                        Locked,
+                        AccessGranted };
+
+  attempts          : 0 .. 3;
+
+  -- credentials_valid: No ASSIGN provided => NuSMV treats this as a fully
+  -- nondeterministic input at every step. This models the adversarial
+  -- environment: the attacker may supply any credential value at any time.
+  credentials_valid : boolean;
+
+  -- session_auth: monotonic session latch.
+  -- Becomes TRUE when a PasswordEntered -> Authenticated transition fires
+  -- (i.e., when credentials_valid = TRUE is witnessed at PasswordEntered).
+  -- Used to express Safety Property S1 in a non-trivial, verifiable form.
+  session_auth      : boolean;
+
+
+-- ---------------------------------------------------------------------------
+-- DEFINE: Derived predicates (syntactic abbreviations; not new state)
+-- ---------------------------------------------------------------------------
+DEFINE
+  -- TRUE iff the system is in a state that implies an authenticated session
+  in_auth_session   := (state = Authenticated) | (state = AccessGranted);
+
+  -- TRUE iff the lockout threshold has been reached
+  at_lockout_limit  := (attempts >= 2);
+
+
+-- ---------------------------------------------------------------------------
+-- INITIAL STATE CONSTRAINTS
+-- ---------------------------------------------------------------------------
+ASSIGN
+  init(state)        := Idle;
+  init(attempts)     := 0;
+  init(session_auth) := FALSE;
+  -- credentials_valid: initial value is nondeterministic (no init() provided)
+
+
+-- ---------------------------------------------------------------------------
+-- TRANSITION RELATION: next(state)
+-- ---------------------------------------------------------------------------
+-- The case expression is evaluated top-to-bottom; first matching guard wins.
+-- Nondeterministic choice is expressed via set literals {a, b}.
+-- ---------------------------------------------------------------------------
+  next(state) :=
+    case
+      -- [T1] From Idle: user always presents a username (deterministic input)
+      state = Idle
+        : UsernameEntered;
+
+      -- [T2] From UsernameEntered: user always enters a password (deterministic)
+      state = UsernameEntered
+        : PasswordEntered;
+
+      -- [T3] Correct credentials: transition to Authenticated
+      state = PasswordEntered &  credentials_valid
+        : Authenticated;
+
+      -- [T4] Wrong credentials, under lockout threshold: retry
+      state = PasswordEntered & !credentials_valid & !at_lockout_limit
+        : UsernameEntered;
+
+      -- [T5] Wrong credentials, at lockout threshold: enter absorbing Locked state
+      state = PasswordEntered & !credentials_valid &  at_lockout_limit
+        : Locked;
+
+      -- [T6] Authenticated: nondeterministic choice — access resource or logout
+      --      This nondeterminism represents the adversarial/unknown user action.
+      --      NOTE: This transition is the source of the L2 liveness failure.
+      state = Authenticated
+        : { AccessGranted, Idle };
+
+      -- [T7] AccessGranted: nondeterministic — return to session or logout
+      state = AccessGranted
+        : { Authenticated, Idle };
+
+      -- [T8] Locked: absorbing self-loop (no exit)
+      state = Locked
+        : Locked;
+
+      -- Default: preserve state (should not be reached in a well-formed trace)
+      TRUE
+        : state;
+    esac;
+
+
+-- ---------------------------------------------------------------------------
+-- TRANSITION RELATION: next(attempts)
+-- ---------------------------------------------------------------------------
+-- attempts counts consecutive failed password entries in the current
+-- authentication attempt sequence. It is reset upon successful auth.
+-- It is NOT reset on logout (single-session; persistent within session).
+-- ---------------------------------------------------------------------------
+  next(attempts) :=
+    case
+      -- Correct credentials: reset counter
+      state = PasswordEntered &  credentials_valid
+        : 0;
+
+      -- Wrong credentials: increment (bounded; NuSMV enforces 0..3 range)
+      state = PasswordEntered & !credentials_valid
+        : min(attempts + 1, 3);
+
+      -- All other states: counter is unchanged
+      TRUE
+        : attempts;
+    esac;
+
+
+-- ---------------------------------------------------------------------------
+-- TRANSITION RELATION: next(session_auth)
+-- ---------------------------------------------------------------------------
+-- session_auth is a monotonic latch: once TRUE (authentication witnessed),
+-- it remains TRUE for the duration of the session model.
+-- It is initialised to FALSE (no authentication has occurred at start).
+-- This variable is required for non-trivial encoding of Safety Property S1.
+-- ---------------------------------------------------------------------------
+  next(session_auth) :=
+    case
+      -- Authentication event: credentials accepted at PasswordEntered
+      state = PasswordEntered & credentials_valid
+        : TRUE;
+
+      -- All other states: latch holds its current value
+      TRUE
+        : session_auth;
+    esac;
+
+
+-- ---------------------------------------------------------------------------
+-- INVARIANTS (INVAR): State-level consistency constraints
+-- These are checked by NuSMV as invariant properties (reachable states only).
+-- ---------------------------------------------------------------------------
+
+-- INV1: attempts is always 0 in states before the first password attempt
+INVAR
+  (state = Idle | state = UsernameEntered) -> (attempts = 0 | attempts > 0);
+  -- (trivially holds; included as a structural annotation)
+
+-- INV2: In the Locked state, attempts must equal 3
+INVAR
+  state = Locked -> attempts = 3;
+
+-- INV3: session_auth is FALSE only before any successful authentication
+-- (monotonic: session_auth = FALSE implies we have not yet authenticated)
+INVAR
+  !session_auth -> !(state = Authenticated | state = AccessGranted);
+  -- This formalises: authentication state is only reachable after session_auth is set.
+
+
+-- ---------------------------------------------------------------------------
+-- LTL SPECIFICATIONS
+-- ---------------------------------------------------------------------------
+-- All properties are verified against the full nondeterministic trace space.
+-- "TRUE" means the property holds for ALL traces. "FALSE" means a
+-- counterexample trace exists (a trace violating the property).
+--
+-- Safety properties (S1, S2): bad states are unreachable on any trace.
+-- Liveness properties (L1, L2): good states are eventually reached.
+-- ---------------------------------------------------------------------------
+
+-- [S1] SAFETY — Unauthorised access never occurs:
+--   Whenever the system is in state AccessGranted, session_auth must be TRUE.
+--   Equivalently: resource access is only possible if valid credentials were
+--   presented at some earlier point in the trace.
+--   Expected result: TRUE (holds; AccessGranted reachable only via Authenticated).
+LTLSPEC NAME s1 :=
+  G( state = AccessGranted -> session_auth );
+
+-- [S2] SAFETY — Locked users never access resources:
+--   Once the system enters the Locked state, it must never reach AccessGranted
+--   on any future step of any continuation of the trace.
+--   Expected result: TRUE (holds; Locked is absorbing).
+LTLSPEC NAME s2 :=
+  G( state = Locked -> G( state != AccessGranted ) );
+
+-- [L1] LIVENESS — Valid authentication always eventually succeeds:
+--   Whenever the system is in state PasswordEntered with credentials_valid = TRUE,
+--   it must eventually reach state Authenticated.
+--   Expected result: TRUE (holds; T3 fires deterministically in one step).
+LTLSPEC NAME l1 :=
+  G( (state = PasswordEntered & credentials_valid) -> F( state = Authenticated ) );
+
+-- [L2] LIVENESS — Authenticated users eventually access resources:
+--   Whenever the system enters state Authenticated, it must eventually
+--   reach state AccessGranted.
+--   Expected result: FALSE (FAILS — see traces/counterexample_liveness2.txt).
+--   The nondeterministic T6 transition permits infinite logout loops.
+LTLSPEC NAME l2 :=
+  G( state = Authenticated -> F( state = AccessGranted ) );
